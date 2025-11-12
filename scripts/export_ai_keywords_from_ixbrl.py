@@ -8,6 +8,7 @@ from zipfile import ZipFile
 import pandas as pd
 import re
 
+DEFAULT_REPORTS_DIR = Path("data/ixbrl-reports")
 DEFAULT_PACKAGES_DIR = Path("data/xbrl-packages")
 DEFAULT_OUTPUT = Path("data/csv-data/ai_keywords_ixbrl.csv")
 
@@ -244,14 +245,68 @@ def collect_results(packages_dir: Path, limit: Optional[int] = None) -> List[Dic
     return results
 
 
+def collect_from_reports(reports_dir: Path) -> List[Dict[str, object]]:
+    files = sorted(reports_dir.glob("*.xhtml")) + sorted(reports_dir.glob("*.html"))
+    if not files:
+        return []
+
+    directory_name = reports_dir.name
+    dir_counter: Counter = Counter()
+    total_keywords = 0
+    records: List[Dict[str, object]] = []
+
+    for file_path in files:
+        try:
+            content = file_path.read_bytes()
+        except Exception as exc:
+            print(f"[warn] Failed to read {file_path}: {exc}")
+            continue
+
+        doc_total, doc_counter = process_ixbrl_document(file_path.name, content)
+        total_keywords += doc_total
+        dir_counter.update(doc_counter)
+
+        records.append(
+            {
+                "package": directory_name,
+                "document": file_path.name,
+                "ai_keyword_total": doc_total,
+                "top_keywords": ", ".join(
+                    f"{keyword}:{count}" for keyword, count in doc_counter.most_common() if count > 0
+                )
+                or "none",
+            }
+        )
+
+    if records:
+        records.append(
+            {
+                "package": directory_name,
+                "document": "__directory_total__",
+                "ai_keyword_total": total_keywords,
+                "top_keywords": ", ".join(
+                    f"{keyword}:{count}" for keyword, count in dir_counter.most_common() if count > 0
+                )
+                or "none",
+            }
+        )
+
+    return records
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Extract AI keyword counts directly from iXBRL report packages."
     )
     parser.add_argument(
+        "--reports-dir",
+        default=str(DEFAULT_REPORTS_DIR),
+        help="Directory containing extracted iXBRL report files (default: data/ixbrl-reports).",
+    )
+    parser.add_argument(
         "--packages-dir",
-        default=str(DEFAULT_PACKAGES_DIR),
-        help="Directory containing XBRL report packages (default: data/xbrl-packages).",
+        help="Optional directory containing XBRL report packages (zip). "
+             "If provided, packages are processed in addition to reports.",
     )
     parser.add_argument(
         "--output",
@@ -265,13 +320,30 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    packages_dir = Path(args.packages_dir)
-    if not packages_dir.exists():
-        raise FileNotFoundError(f"Packages directory not found: {packages_dir}")
+    reports_dir = Path(args.reports_dir)
+    packages_dir = Path(args.packages_dir) if args.packages_dir else None
 
-    results = collect_results(packages_dir, limit=args.limit)
+    results: List[Dict[str, object]] = []
+
+    if reports_dir.exists():
+        report_records = collect_from_reports(reports_dir)
+        if report_records:
+            results.extend(report_records)
+        else:
+            print(f"[warn] No iXBRL files found in {reports_dir}")
+    else:
+        print(f"[warn] Reports directory not found: {reports_dir}")
+
+    if packages_dir:
+        if packages_dir.exists():
+            package_records = collect_results(packages_dir, limit=args.limit)
+            if package_records:
+                results.extend(package_records)
+        else:
+            print(f"[warn] Packages directory not found: {packages_dir}")
+
     if not results:
-        print("No AI keyword results generated from iXBRL packages.")
+        print("No AI keyword results generated from the provided sources.")
         return
 
     df = pd.DataFrame(results)

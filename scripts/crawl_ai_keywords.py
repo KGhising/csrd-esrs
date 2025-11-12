@@ -10,7 +10,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 
-DEFAULT_JSON_DIR = Path("data/xbrl-json")
+DEFAULT_IXBRL_DIR = Path("data/ixbrl-reports")
 DEFAULT_OUTPUT = Path("data/csv-data/ai_keyword_counts.csv")
 
 # Keywords and phrases associated with AI across several languages.
@@ -123,6 +123,28 @@ def extract_candidate_urls(data: dict) -> Set[str]:
     return filtered
 
 
+IXBRL_URL_PATTERN = re.compile(r"https?://[^\s\"'<>)]+")
+
+
+def extract_candidate_urls_from_ixbrl(html: str) -> Set[str]:
+    urls: Set[str] = set()
+    for match in IXBRL_URL_PATTERN.findall(html):
+        urls.add(match)
+
+    filtered: Set[str] = set()
+    for url in urls:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            continue
+        netloc_lower = parsed.netloc.lower()
+        if any(blocked in netloc_lower for blocked in NAMESPACE_BLOCKLIST):
+            continue
+        base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        filtered.add(base)
+
+    return filtered
+
+
 def fetch_url(url: str, timeout: int) -> Tuple[Optional[str], Optional[str]]:
     try:
         response = requests.get(url, headers=REQUEST_HEADERS, timeout=(5, timeout), allow_redirects=True)
@@ -222,10 +244,13 @@ def crawl_domain(domain: str, max_pages: int, timeout: int) -> Tuple[int, Counte
     return pages_scanned, keyword_counter
 
 
-def build_results(json_dir: Path, max_pages: int, timeout: int) -> List[Dict[str, object]]:
-    max_pages = max(max_pages, 5)
+def collect_from_json(
+    json_dir: Path,
+    max_pages: int,
+    timeout: int,
+    seen_domains: Set[str],
+) -> List[Dict[str, object]]:
     results: List[Dict[str, object]] = []
-    seen_domains: Set[str] = set()
 
     for json_file in sorted(json_dir.glob("*.json")):
         try:
@@ -280,6 +305,72 @@ def build_results(json_dir: Path, max_pages: int, timeout: int) -> List[Dict[str
     return results
 
 
+def collect_from_ixbrl(
+    ixbrl_dir: Path,
+    max_pages: int,
+    timeout: int,
+    seen_domains: Set[str],
+) -> List[Dict[str, object]]:
+    results: List[Dict[str, object]] = []
+    files = sorted(ixbrl_dir.glob("*.xhtml")) + sorted(ixbrl_dir.glob("*.html"))
+
+    if not files:
+        print(f"[warn] No iXBRL files found in {ixbrl_dir}")
+        return results
+
+    for report_file in files:
+        try:
+            html = report_file.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            print(f"[warn] Failed to read {report_file.name}: {exc}")
+            continue
+
+        candidate_domains = extract_candidate_urls_from_ixbrl(html)
+        if not candidate_domains:
+            print(f"No company URLs found in {report_file.name}")
+            continue
+
+        entity_id = report_file.stem
+
+        for domain in candidate_domains:
+            if domain in seen_domains:
+                print(f"[skip] {domain} already processed; skipping crawl")
+                results.append(
+                    {
+                        "entity": entity_id,
+                        "domain": domain,
+                        "pages_scanned": 0,
+                        "ai_keyword_total": 0,
+                        "top_keywords": "",
+                    }
+                )
+                continue
+
+            pages_scanned, keyword_counts = crawl_domain(domain, max_pages=max_pages, timeout=timeout)
+            seen_domains.add(domain)
+
+            total_matches = sum(keyword_counts.values())
+            top_keywords = ", ".join(
+                f"{keyword}:{count}" for keyword, count in keyword_counts.most_common() if count > 0
+            )
+
+            results.append(
+                {
+                    "entity": entity_id,
+                    "domain": domain,
+                    "pages_scanned": pages_scanned,
+                    "ai_keyword_total": total_matches,
+                    "top_keywords": top_keywords,
+                }
+            )
+            print(
+                f"[result] {domain}: pages={pages_scanned}, matches={total_matches}, "
+                f"top_keywords='{top_keywords or 'none'}'"
+            )
+
+    return results
+
+
 def dataframe_from_results(results: List[Dict[str, object]]) -> Optional["pd.DataFrame"]:
     if not results:
         return None
@@ -288,12 +379,17 @@ def dataframe_from_results(results: List[Dict[str, object]]) -> Optional["pd.Dat
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract company URLs from JSON reports, crawl their websites, and count AI-related keywords."
+        description="Extract company URLs from filings, crawl their websites, and count AI-related keywords."
     )
     parser.add_argument(
         "--json-dir",
-        default=str(DEFAULT_JSON_DIR),
+        default="data/xbrl-json",
         help="Directory containing XBRL JSON filings (default: data/xbrl-json).",
+    )
+    parser.add_argument(
+        "--ixbrl-dir",
+        default=str(DEFAULT_IXBRL_DIR),
+        help="Directory containing extracted iXBRL report files (default: data/ixbrl-reports).",
     )
     parser.add_argument(
         "--output",
@@ -315,15 +411,39 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    json_dir = Path(args.json_dir)
-    if not json_dir.exists():
-        raise FileNotFoundError(f"JSON directory not found: {json_dir}")
-
     effective_max_pages = max(args.max_pages, 5)
     if effective_max_pages != args.max_pages:
         print(f"Requested max pages {args.max_pages} is below minimum. Using {effective_max_pages}.")
 
-    results = build_results(json_dir=json_dir, max_pages=effective_max_pages, timeout=args.timeout)
+    seen_domains: Set[str] = set()
+    results: List[Dict[str, object]] = []
+
+    ixbrl_dir = Path(args.ixbrl_dir) if args.ixbrl_dir else None
+    if ixbrl_dir and ixbrl_dir.exists():
+        results.extend(
+            collect_from_ixbrl(
+                ixbrl_dir=ixbrl_dir,
+                max_pages=effective_max_pages,
+                timeout=args.timeout,
+                seen_domains=seen_domains,
+            )
+        )
+    elif ixbrl_dir:
+        print(f"[warn] iXBRL directory not found: {ixbrl_dir}")
+
+    json_dir = Path(args.json_dir) if args.json_dir else None
+    if json_dir and json_dir.exists():
+        results.extend(
+            collect_from_json(
+                json_dir=json_dir,
+                max_pages=effective_max_pages,
+                timeout=args.timeout,
+                seen_domains=seen_domains,
+            )
+        )
+    elif json_dir:
+        print(f"[warn] JSON directory not found: {json_dir}")
+
     df = dataframe_from_results(results)
 
     if df is None or df.empty:

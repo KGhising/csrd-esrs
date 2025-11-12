@@ -1,6 +1,7 @@
 import argparse
 from urllib.parse import urlencode, urljoin
 from pathlib import Path
+from zipfile import ZipFile
 import requests
 
 API_BASE = "https://filings.xbrl.org/api/filings"
@@ -79,6 +80,8 @@ def main():
     p.add_argument('--out-package', default='data/xbrl-packages')
     p.add_argument('--skip-json', action='store_true')
     p.add_argument('--skip-package', action='store_true')
+    p.add_argument('--out-ixbrl', default='data/ixbrl-reports')
+    p.add_argument('--skip-ixbrl', action='store_true')
     args = p.parse_args()
 
     qp = {}
@@ -119,6 +122,7 @@ def main():
 
     out_json = Path(args.out_json); out_json.mkdir(parents=True, exist_ok=True)
     out_package = Path(args.out_package); out_package.mkdir(parents=True, exist_ok=True)
+    out_ixbrl = Path(args.out_ixbrl); out_ixbrl.mkdir(parents=True, exist_ok=True)
 
     n = 0
     fetch_limit = args.limit * 10 if (min_date or args.company) and args.limit else None
@@ -157,6 +161,25 @@ def main():
                 r.raise_for_status()
                 pkg_path.write_bytes(r.content)
                 print('[PKG]', pkg_path)
+
+                if not args.skip_ixbrl:
+                    try:
+                        with ZipFile(pkg_path) as zf:
+                            extracted = False
+                            for member in zf.namelist():
+                                member_lower = member.lower()
+                                if member_lower.endswith('.xhtml') and '/reports/' in member_lower:
+                                    data = zf.read(member)
+                                    dest_dir = out_ixbrl
+                                    dest_dir.mkdir(parents=True, exist_ok=True)
+                                    dest_path = dest_dir / Path(member).name
+                                    dest_path.write_bytes(data)
+                                    extracted = True
+                                    print('[IXBRL]', dest_path)
+                            if not extracted:
+                                print('[IXBRL] No .xhtml report found in', pkg_path)
+                    except Exception as ix_err:
+                        print('[IXBRL] Failed to extract from', pkg_path, ix_err)
             except Exception as e:
                 print('Package failed:', filing_id, e)
 
