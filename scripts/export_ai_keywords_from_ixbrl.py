@@ -7,6 +7,7 @@ from zipfile import ZipFile
 
 import pandas as pd
 import re
+from tqdm import tqdm
 
 DEFAULT_REPORTS_DIR = Path("data/ixbrl-reports")
 DEFAULT_PACKAGES_DIR = Path("data/xbrl-packages")
@@ -91,31 +92,29 @@ class SimpleHTMLExtractor(HTMLParser):
 
         return False
 
-    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+    def handle_starttag(self, tag: str, attrs) -> None:
         parent_ignored = self._ignore_stack[-1]
         ignore = parent_ignored or self._should_ignore(tag, attrs)
         self._ignore_stack.append(ignore)
 
-    def handle_startendtag(self, tag: str, attrs) -> None:  # type: ignore[override]
+    def handle_startendtag(self, tag: str, attrs) -> None:
         parent_ignored = self._ignore_stack[-1]
         ignore = parent_ignored or self._should_ignore(tag, attrs)
         if not ignore:
-            # Self-closing tag with visible text (rare) – nothing to append.
             pass
 
-    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+    def handle_endtag(self, tag: str) -> None:
         if self._ignore_stack:
             self._ignore_stack.pop()
 
-    def handle_data(self, data: str) -> None:  # type: ignore[override]
+    def handle_data(self, data: str) -> None:
         if not self._ignore_stack or self._ignore_stack[-1]:
             return
         if not data:
             return
         self._chunks.append(data)
 
-    def handle_comment(self, data: str) -> None:  # type: ignore[override]
-        # Ignore comments entirely.
+    def handle_comment(self, data: str) -> None: 
         pass
 
     @property
@@ -238,8 +237,7 @@ def collect_results(packages_dir: Path, limit: Optional[int] = None) -> List[Dic
     files = sorted(packages_dir.glob("*.zip"))
     if limit:
         files = files[:limit]
-
-    for zip_path in files:
+    for zip_path in tqdm(files, desc="Processing packages", unit="package"):
         results.extend(process_package(zip_path))
 
     return results
@@ -255,7 +253,7 @@ def collect_from_reports(reports_dir: Path) -> List[Dict[str, object]]:
     total_keywords = 0
     records: List[Dict[str, object]] = []
 
-    for file_path in files:
+    for file_path in tqdm(files, desc=f"Processing {directory_name}", unit="file"):
         try:
             content = file_path.read_bytes()
         except Exception as exc:
