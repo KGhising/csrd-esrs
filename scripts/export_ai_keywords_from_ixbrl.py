@@ -2,7 +2,9 @@ import argparse
 from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
+from xml.etree import ElementTree as ET
 
 import pandas as pd
 import re
@@ -10,6 +12,149 @@ from tqdm import tqdm
 
 DEFAULT_REPORTS_DIR = Path("data/ixbrl-reports")
 DEFAULT_OUTPUT = Path("data/csv-data/ai_keywords_ixbrl.csv")
+
+COMPANY_NAME_CONCEPTS: Sequence[str] = (
+    "ifrs-full:NameOfReportingEntityOrOtherMeansOfIdentification",
+    "ifrs-full:NameOfParentEntity",
+    "esef_cor:NameOrOtherDesignationOfReportingEntity",
+    "esef_cor:NameOfReportingEntityOrOtherMeansOfIdentification",
+    "esef_cor:LegalName",
+    "esef_cor:NameOfParentCompany",
+    "esef_cor:NameOfIssuer",
+    "esef_cor:EntityRegisteredName",
+    "uk-core:EntityName",
+    "core:EntityName",
+)
+
+IX_NS = "http://www.xbrl.org/2013/inlineXBRL"
+XBRLI_NS = "http://www.xbrl.org/2003/instance"
+LINK_NS = "http://www.xbrl.org/2003/linkbase"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+LEI_PATTERN = re.compile(r"[A-Z0-9]{20}")
+
+def iter_values(value: Any) -> Iterable[str]:
+    if value is None:
+        return
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from iter_values(item)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from iter_values(item)
+        return
+    yield str(value)
+
+
+def extract_lei(*candidates: Any) -> Optional[str]:
+    for candidate in candidates:
+        for text in iter_values(candidate):
+            normalized = re.sub(r"[^A-Z0-9]", "", text.upper())
+            match = LEI_PATTERN.search(normalized)
+            if match:
+                return match.group(0)
+    return None
+
+
+def split_slug_tokens(slug: str) -> List[str]:
+    if not slug:
+        return []
+    raw_tokens = re.findall(r"[A-Za-z]+|\d+", slug)
+    tokens: List[str] = []
+    for token in raw_tokens:
+        if token.isdigit():
+            tokens.append(token)
+        else:
+            tokens.append(token.capitalize())
+    if tokens and tokens[-1].lower() == "plc":
+        tokens[-1] = "PLC"
+    return tokens
+
+
+def derive_company_name_from_href(href: Optional[str]) -> Optional[str]:
+    if not href:
+        return None
+    parsed = urlparse(href)
+    host = parsed.netloc or ""
+    if not host:
+        host = parsed.path.split("/")[0] if parsed.path else ""
+    if not host:
+        return None
+    host = host.split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    parts = host.split(".")
+    core = parts[-2] if len(parts) >= 2 else parts[0]
+    tokens = split_slug_tokens(core)
+    if not tokens:
+        return None
+    return " ".join(tokens)
+
+
+def build_continuation_map(root: ET.Element) -> Dict[str, ET.Element]:
+    continuations: Dict[str, ET.Element] = {}
+    for elem in root.findall(f".//{{{IX_NS}}}continuation"):
+        elem_id = elem.get("id")
+        if elem_id:
+            continuations[elem_id] = elem
+    return continuations
+
+
+def get_fact_text(fact: ET.Element, continuation_map: Dict[str, ET.Element]) -> str:
+    parts: List[str] = ["".join(fact.itertext())]
+    continuation_ref = fact.get("continuedAt")
+    while continuation_ref:
+        continuation = continuation_map.get(continuation_ref)
+        if continuation is None:
+            break
+        parts.append("".join(continuation.itertext()))
+        continuation_ref = continuation.get("continuedAt")
+    text = "".join(parts)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_company_name_from_ixbrl(
+    root: ET.Element,
+    continuation_map: Dict[str, ET.Element],
+) -> Optional[str]:
+    for concept in COMPANY_NAME_CONCEPTS:
+        for fact in root.findall(f".//{{{IX_NS}}}nonNumeric[@name='{concept}']"):
+            text = get_fact_text(fact, continuation_map)
+            if text:
+                return text
+    schema_ref = root.find(f".//{{{LINK_NS}}}schemaRef")
+    if schema_ref is not None:
+        href = schema_ref.get(f"{{{XLINK_NS}}}href")
+        name = derive_company_name_from_href(href)
+        if name:
+            return name
+    return None
+
+
+def extract_metadata_from_html(html: str) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        root = ET.fromstring(html)
+    except ET.ParseError:
+        return None, None
+
+    lei = None
+    for context in root.findall(f".//{{{XBRLI_NS}}}context"):
+        identifier_elem = context.find(f".//{{{XBRLI_NS}}}identifier")
+        if identifier_elem is not None and identifier_elem.text:
+            lei = extract_lei(identifier_elem.text, identifier_elem.attrib)
+            if lei:
+                break
+
+    if not lei:
+        return None, None
+
+    continuation_map = build_continuation_map(root)
+    company_name = extract_company_name_from_ixbrl(root, continuation_map)
+    return lei, company_name
+
 
 RAW_KEYWORDS: List[str] = [
     "artificial intelligence",
@@ -163,11 +308,14 @@ def analyse_text(text: str) -> Counter:
     return counter
 
 
-def process_ixbrl_document(name: str, content: bytes) -> Tuple[int, Counter]:
+def process_ixbrl_document(name: str, content: bytes) -> Optional[Tuple[str, Optional[str], int, Counter]]:
     html = decode_html(content)
+    entity, company_name = extract_metadata_from_html(html)
+    if not entity:
+        return None
     text = extract_text(html)
     keyword_counts = analyse_text(text)
-    return sum(keyword_counts.values()), keyword_counts
+    return entity, company_name, sum(keyword_counts.values()), keyword_counts
 
 
 def collect_from_reports(reports_dir: Path) -> List[Dict[str, object]]:
@@ -175,42 +323,43 @@ def collect_from_reports(reports_dir: Path) -> List[Dict[str, object]]:
     if not files:
         return []
 
-    directory_name = reports_dir.name
-    dir_counter: Counter = Counter()
-    total_keywords = 0
-    records: List[Dict[str, object]] = []
+    entity_stats: Dict[str, Dict[str, Any]] = {}
 
-    for file_path in tqdm(files, desc=f"Processing {directory_name}", unit="file"):
+    for file_path in tqdm(files, desc=f"Processing {reports_dir.name}", unit="file"):
         try:
             content = file_path.read_bytes()
         except Exception as exc:
             print(f"[warn] Failed to read {file_path}: {exc}")
             continue
 
-        doc_total, doc_counter = process_ixbrl_document(file_path.name, content)
-        total_keywords += doc_total
-        dir_counter.update(doc_counter)
+        result = process_ixbrl_document(file_path.name, content)
+        if result is None:
+            continue
+        entity, company_name, doc_total, doc_counter = result
 
-        records.append(
+        entry = entity_stats.setdefault(
+            entity,
             {
-                "package": directory_name,
-                "document": file_path.name,
-                "ai_keyword_total": doc_total,
-                "top_keywords": ", ".join(
-                    f"{keyword}:{count}" for keyword, count in doc_counter.most_common() if count > 0
-                )
-                or "none",
-            }
+                "entity": entity,
+                "company_name": company_name or "",
+                "ai_keyword_total": 0,
+                "counter": Counter(),
+            },
         )
+        if company_name and not entry["company_name"]:
+            entry["company_name"] = company_name
+        entry["ai_keyword_total"] += doc_total
+        entry["counter"].update(doc_counter)
 
-    if records:
+    records: List[Dict[str, object]] = []
+    for entity_id, stats in entity_stats.items():
         records.append(
             {
-                "package": directory_name,
-                "document": "__directory_total__",
-                "ai_keyword_total": total_keywords,
+                "entity": entity_id,
+                "company_name": stats["company_name"],
+                "ai_keyword_total": stats["ai_keyword_total"],
                 "top_keywords": ", ".join(
-                    f"{keyword}:{count}" for keyword, count in dir_counter.most_common() if count > 0
+                    f"{keyword}:{count}" for keyword, count in stats["counter"].most_common() if count > 0
                 )
                 or "none",
             }
@@ -221,7 +370,7 @@ def collect_from_reports(reports_dir: Path) -> List[Dict[str, object]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract AI keyword counts directly from iXBRL report packages."
+        description="Extract AI keyword counts from iXBRL reports, aggregated by entity (LEI)."
     )
     parser.add_argument(
         "--reports-dir",
@@ -253,15 +402,14 @@ def main() -> None:
         return
 
     df = pd.DataFrame(results)
-    df = df.sort_values(by=["package", "document"]).reset_index(drop=True)
+    df = df.sort_values(by=["entity"]).reset_index(drop=True)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
-    packages_processed = df["package"].nunique()
     print(f"AI keyword counts (iXBRL) saved to: {output_path}")
-    print(f"Packages processed: {packages_processed}")
+    print(f"Entities processed: {df['entity'].nunique()}")
     print(f"Rows written: {len(df)}")
 
 
