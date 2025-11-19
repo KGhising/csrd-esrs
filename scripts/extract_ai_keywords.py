@@ -137,14 +137,42 @@ def extract_company_name_from_ixbrl(
 def clean_period(period: Optional[str]) -> str:
     if not period:
         return "Unknown"
-    text = str(period)
-    if "T" in text and "/" in text:
-        text = text.split("/", 1)[0]
+    text = str(period).strip()
+    
+    # Handle ISO 8601 format with time: "2020-12-31T00:00:00" or "2020-12-31T00:00:00Z"
     if "T" in text:
-        return text.split("T")[0][:4]
+        text = text.split("T")[0]
+    
+    # Handle date ranges: "2020-01-01/2021-12-31"
     if "/" in text:
-        return text.split("/", 1)[0][:4]
-    return text[:4]
+        parts = text.split("/")
+        # Try to extract year from each part, prefer the end date (last part)
+        for part in reversed(parts):
+            part = part.strip()
+            # Check if part starts with a 4-digit year (YYYY-MM-DD or YYYY/MM/DD)
+            year_match = re.match(r"^(\d{4})", part)
+            if year_match:
+                year = year_match.group(1)
+                # Validate year is reasonable (1900-2100)
+                if 1900 <= int(year) <= 2100:
+                    return year
+        # Fallback: try first part
+        text = parts[0].strip()
+    
+    # Extract 4-digit year from beginning of string (handles YYYY-MM-DD, YYYY/MM/DD, etc.)
+    year_match = re.match(r"^(\d{4})", text)
+    if year_match:
+        year = year_match.group(1)
+        # Validate year is reasonable (1900-2100)
+        if 1900 <= int(year) <= 2100:
+            return year
+    
+    # Fallback: try to find any 4-digit year in the string
+    year_matches = re.findall(r"\b(19\d{2}|20\d{2})\b", text)
+    if year_matches:
+        return year_matches[-1]  # Return the last (most recent) year found
+    
+    return "Unknown"
 
 
 def extract_metadata_from_html(html: str) -> Tuple[Optional[str], Optional[str], List[str]]:
@@ -350,7 +378,18 @@ def process_ixbrl_document(name: str, content: bytes) -> List[Tuple[str, Optiona
     keyword_counts = analyse_text(text)
     total_count = sum(keyword_counts.values())
     
+    # Use the maximum year found as the reporting year
+    # Note: This means if a document contains multiple years, only the latest is used
     reporting_year = max(years)
+    
+    # Debug: log if document contains years outside expected range
+    if years:
+        year_ints = [int(y) for y in years if y.isdigit()]
+        if year_ints:
+            min_year = min(year_ints)
+            max_year = max(year_ints)
+            if min_year < 2021 or max_year > 2025:
+                print(f"[debug] Document {name} (entity: {entity}) contains years: {sorted(years)} (range: {min_year}-{max_year})")
     
     return [(entity, company_name, reporting_year, total_count, keyword_counts)]
 
@@ -459,6 +498,13 @@ def main() -> None:
     print(f"\nYears found in data before pivoting:")
     for year, count in year_counts.items():
         print(f"  {year}: {count} entity-year combinations")
+    
+    # Show year range
+    if not year_counts.empty:
+        min_year = min(year_counts.index.astype(int))
+        max_year = max(year_counts.index.astype(int))
+        print(f"\nYear range: {min_year} to {max_year}")
+        print(f"Total unique years: {len(year_counts)}")
     
     all_years = sorted(df["year"].unique().astype(str))
     all_entities = df[["entity", "company_name"]].drop_duplicates().sort_values(["entity"])

@@ -32,21 +32,13 @@ def clean_ai_keywords(df: pd.DataFrame, required_years: List[str]) -> pd.DataFra
     required_columns = base_columns + year_columns + top_keywords_columns
     
     df_cleaned = df[required_columns].copy()
-    print(f"After selecting columns: {len(df_cleaned)} rows")
     
     df_cleaned = df_cleaned.replace({"": pd.NA, " ": pd.NA})
     
     for year in year_columns:
         df_cleaned[year] = pd.to_numeric(df_cleaned[year], errors="coerce")
     
-    print(f"Before dropna: {len(df_cleaned)} rows")
-    rows_with_all_years = df_cleaned[year_columns].notna().all(axis=1).sum()
-    rows_with_any_year = df_cleaned[year_columns].notna().any(axis=1).sum()
-    print(f"Rows with ALL specified years: {rows_with_all_years}")
-    print(f"Rows with ANY specified year: {rows_with_any_year}")
-    
-    df_cleaned = df_cleaned.dropna(subset=year_columns, how="all")
-    print(f"After dropna (keeping rows with at least one year): {len(df_cleaned)} rows")
+    df_cleaned = df_cleaned.dropna(subset=year_columns)
     
     return df_cleaned
 

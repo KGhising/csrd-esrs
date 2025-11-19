@@ -375,9 +375,41 @@ def extract_row_from_json(
     }
 
 
-def gather_concepts(files: List[Path], target_concepts: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def get_processed_files(output_path: Path) -> set[str]:
+    """Get set of source files that have already been processed (from existing CSV)."""
+    if not output_path.exists():
+        return set()
+    try:
+        df = pd.read_csv(output_path)
+        if "source_file" in df.columns:
+            return set(df["source_file"].unique())
+    except Exception:
+        pass
+    return set()
+
+
+def gather_concepts(
+    files: List[Path],
+    target_concepts: Optional[List[str]] = None,
+    skip_processed: bool = False,
+    processed_files: Optional[set[str]] = None,
+) -> tuple[List[Dict[str, Any]], int]:
+    """
+    Gather concepts from files.
+    
+    Returns:
+        tuple: (rows, skipped_count)
+    """
     rows: List[Dict[str, Any]] = []
+    skipped = 0
+    processed_files = processed_files or set()
+    
     for path in tqdm(files, desc="Processing filings", unit="file"):
+        # Skip if file has already been processed
+        if skip_processed and path.name in processed_files:
+            skipped += 1
+            continue
+            
         suffix = path.suffix.lower()
         if suffix == ".json":
             try:
@@ -396,7 +428,7 @@ def gather_concepts(files: List[Path], target_concepts: Optional[List[str]] = No
         else:
             print(f"[warn] Unsupported file type skipped: {path.name}")
 
-    return rows
+    return rows, skipped
 
 
 def clean_period(period: Optional[str]) -> str:
@@ -459,6 +491,16 @@ def main() -> None:
         default=None,
         help="Filter by specific concepts (e.g., --concepts Equity Revenue Assets). If not specified, extracts all facts.",
     )
+    parser.add_argument(
+        "--skip-processed",
+        action="store_true",
+        help="Skip files that have already been processed (based on source_file in existing output CSV).",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append to existing CSV instead of overwriting (combines with existing data).",
+    )
 
     args = parser.parse_args()
     input_dir = Path(args.input_dir)
@@ -474,19 +516,55 @@ def main() -> None:
         print(f"No supported files found in {target}")
         return
 
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Get list of already processed files if skipping
+    processed_files = set()
+    existing_tabular = None
+    if args.skip_processed or args.append:
+        processed_files = get_processed_files(output_path)
+        if args.append and output_path.exists():
+            try:
+                existing_tabular = pd.read_csv(output_path)
+                if len(processed_files) > 0:
+                    print(f"Found {len(processed_files)} already processed files in existing CSV")
+            except Exception as exc:
+                print(f"[warn] Could not read existing CSV: {exc}")
+
     target_concepts = args.concepts
-    rows = gather_concepts(files, target_concepts)
+    rows, skipped = gather_concepts(files, target_concepts, skip_processed=args.skip_processed, processed_files=processed_files)
+    
+    if skipped > 0:
+        print(f"Skipped {skipped} already processed file(s)")
+    
     if not rows:
+        if existing_tabular is not None and args.append:
+            print("No new facts found, keeping existing CSV.")
+            return
         print("No key concept facts found in the provided files.")
         return
 
     tabular = to_tabular(rows)
     if tabular.empty:
+        if existing_tabular is not None and args.append:
+            print("No new tabular data produced, keeping existing CSV.")
+            return
         print("No tabular data produced.")
         return
 
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Combine with existing data if appending
+    if args.append and existing_tabular is not None and not existing_tabular.empty:
+        # Set index for merging, then combine (new values take precedence, old fills gaps)
+        index_cols = ["entity", "company_name", "concept"]
+        existing_tabular = existing_tabular.set_index(index_cols)
+        tabular = tabular.set_index(index_cols)
+        # Combine: new values override old ones, but keep old values where new ones don't exist
+        # Start with new values, fill missing with old values
+        tabular = tabular.combine_first(existing_tabular)
+        tabular = tabular.reset_index()
+        tabular = tabular.sort_values(["entity", "concept"]).reset_index(drop=True)
+
     tabular.to_csv(output_path, index=False, encoding="utf-8-sig")
 
     print(f"Key concept tabular data saved to: {output_path}")
